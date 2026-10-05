@@ -1,0 +1,1656 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Nuancier Mural</title>
+
+<!-- Installation sur l'écran d'accueil (Android/Chrome au premier chef ; -->
+<!-- dégrade proprement si le manifeste n'est pas pris en compte). -->
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#1F6F78">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Nuancier Mural">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+
+<style>
+  /* Page autonome (hors sandbox d'artifact) : flux caméra natif en direct.
+     La vidéo est dessinée image par image sur un <canvas> (comme pour
+     l'export), où la teinte des zones est appliquée en pixels. On a
+     d'abord essayé une superposition DOM en mix-blend-mode par-dessus la
+     balise <video>, mais la plupart des navigateurs affichent la vidéo via
+     un circuit d'accélération matérielle séparé qui ne se mélange pas
+     avec le CSS — la couleur n'apparaissait jamais. Les div ".zone-el"
+     restent, mais seulement comme contour + poignées de manipulation. */
+  :root{
+    --bg:#F1F3F0; --surface:#FFFFFF; --surface-2:#E7EAE4;
+    --fg:#1C2321; --muted:#5B655E; --accent:#1F6F78; --accent-ink:#FFFFFF;
+    --warn:#A14F28; --border:#D7DBD3; --focus:#1F6F78;
+    --font-display:'Fraunces', Georgia, serif;
+    --font-body:'Public Sans', -apple-system, 'Segoe UI', Roboto, sans-serif;
+    --font-mono:'IBM Plex Mono', 'Courier New', monospace;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#14191A; --surface:#1C2223; --surface-2:#252B2B; --fg:#ECEFEC;
+      --muted:#9BA49E; --accent:#55BCC4; --accent-ink:#0B1415; --warn:#E08E60;
+      --border:#323938; --focus:#55BCC4; color-scheme:dark; }
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  /* IMPORTANT : sans cette règle, les écrans "display:flex" ci-dessous
+     restent peints même avec l'attribut [hidden] (même spécificité CSS
+     que la règle du navigateur) et bloquent les clics par-dessus les
+     autres écrans — c'était le bug qui empêchait d'activer la caméra. */
+  [hidden]{display:none!important}
+  body{margin:0; background:var(--bg); color:var(--fg); font-family:var(--font-body)}
+  h1,h2{font-family:var(--font-display); font-weight:600; margin:0}
+  button{font-family:inherit}
+  :focus-visible{outline:2px solid var(--focus); outline-offset:2px}
+  img{max-width:100%}
+
+  .app{display:flex; flex-direction:column; height:100%}
+
+  header{
+    display:flex; align-items:center; justify-content:space-between; gap:10px;
+    padding:12px 16px; padding-top:calc(12px + env(safe-area-inset-top,0px));
+    border-bottom:1px solid var(--border); background:var(--surface);
+  }
+  header h1{font-size:17px}
+  header .eyebrow{display:block; font-family:var(--font-mono); font-size:10px; letter-spacing:.1em; text-transform:uppercase; color:var(--accent)}
+
+  main{flex:1; display:flex; flex-direction:column; min-height:0}
+  @media (min-width:880px){ main{flex-direction:row} }
+
+  /* ---------- scène caméra ---------- */
+  .stage-col{position:relative; flex:1; min-height:0; display:flex; flex-direction:column}
+  .stage{
+    position:relative; flex:1; min-height:280px; background:#0b0e0d; overflow:hidden;
+    touch-action:none;
+  }
+  .stage video{
+    /* la vidéo elle-même reste invisible : elle n'est utilisée que comme
+       source d'image pour le canevas visible ci-dessous */
+    position:absolute; width:1px; height:1px; opacity:0; pointer-events:none;
+  }
+  .stage canvas#c-view{
+    position:absolute; inset:0; width:100%; height:100%; display:block;
+  }
+
+  .start-screen, .error-screen{
+    position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:14px; text-align:center; padding:24px;
+    background:var(--surface); color:var(--fg); z-index:5;
+  }
+  .start-screen svg, .error-screen svg{width:44px; height:44px; color:var(--accent)}
+  .error-screen svg{color:var(--warn)}
+  .start-screen p, .error-screen p{max-width:38ch; color:var(--muted); font-size:13.5px; margin:0}
+
+  .btn{
+    border:1px solid var(--border); background:var(--surface); color:var(--fg);
+    border-radius:8px; padding:10px 16px; font-size:14px; font-weight:600; cursor:pointer;
+  }
+  .btn:hover{border-color:var(--accent)}
+  .btn:disabled{opacity:.45; cursor:not-allowed}
+  .btn-accent{background:var(--accent); color:var(--accent-ink); border-color:var(--accent)}
+  .btn-sm{padding:6px 11px; font-size:12.5px}
+  .btn-icon{
+    width:38px; height:38px; border-radius:50%; display:inline-flex; align-items:center;
+    justify-content:center; padding:0; border:1px solid var(--border); background:var(--surface); cursor:pointer;
+  }
+
+  /* repère de positionnement par-dessus le canevas : la couleur réelle est
+     peinte dans le canevas lui-même, ceci n'est qu'un contour manipulable */
+  .zone-el{
+    position:absolute; border:1.5px dashed rgba(255,255,255,.9); border-radius:3px;
+    background:transparent; touch-action:none; cursor:move;
+    box-shadow:0 0 0 1px rgba(0,0,0,.35);
+  }
+  .zone-el[data-selected="true"]{border-color:#fff; border-style:solid}
+  .zone-el .handle{
+    position:absolute; width:28px; height:28px; background:#fff; border:1.5px solid #1C2321;
+    border-radius:50%; touch-action:none;
+  }
+  .handle.nw{left:-14px; top:-14px; cursor:nwse-resize}
+  .handle.ne{right:-14px; top:-14px; cursor:nesw-resize}
+  .handle.sw{left:-14px; bottom:-14px; cursor:nesw-resize}
+  .handle.se{right:-14px; bottom:-14px; cursor:nwse-resize}
+  .zone-el .zone-tag{
+    position:absolute; top:-24px; left:-1.5px; background:#1C2321; color:#fff; font-size:10.5px;
+    font-family:var(--font-mono); padding:2px 6px; border-radius:4px; mix-blend-mode:normal;
+    white-space:nowrap;
+  }
+
+  .stage-toolbar{
+    display:flex; align-items:center; gap:8px; padding:10px 12px;
+    padding-bottom:calc(10px + env(safe-area-inset-bottom,0px));
+    border-top:1px solid var(--border); background:var(--surface); flex-wrap:wrap;
+  }
+  .stage-toolbar .spacer{flex:1}
+  .live-dot{display:inline-flex; align-items:center; gap:6px; font-size:11.5px; color:var(--muted); font-family:var(--font-mono)}
+  .live-dot span{width:7px; height:7px; border-radius:50%; background:#c0392b}
+  @media (prefers-reduced-motion:no-preference){
+    .live-dot span{animation:pulse 1.6s ease-in-out infinite}
+  }
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+  /* ---------- panneau latéral ---------- */
+  .sidebar{
+    display:flex; flex-direction:column; gap:12px; padding:14px;
+    padding-bottom:calc(14px + env(safe-area-inset-bottom,0px));
+    background:var(--bg); overflow-y:auto; max-height:46vh;
+  }
+  @media (min-width:880px){ .sidebar{width:320px; max-height:none; border-left:1px solid var(--border)} }
+
+  .panel{background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:12px}
+  .panel h2{font-size:13px; margin-bottom:9px}
+  .panel .note{font-size:11px; color:var(--muted); font-weight:400}
+
+  .swatches{display:grid; grid-template-columns:repeat(5,1fr); gap:6px}
+  .swatch{border:2px solid transparent; border-radius:7px; aspect-ratio:1; cursor:pointer; padding:0}
+  .swatch[aria-pressed="true"]{border-color:var(--surface); box-shadow:0 0 0 2px var(--fg)}
+
+  .custom-row{display:flex; gap:7px; margin-top:10px}
+  .custom-row input[type="color"]{width:32px; height:32px; border-radius:7px; border:1px solid var(--border); padding:0; background:none; cursor:pointer}
+  .hex-input{flex:1; min-width:0; font-family:var(--font-mono); font-size:12.5px; border:1px solid var(--border); border-radius:7px; padding:6px 8px; background:var(--surface); color:var(--fg)}
+  .hex-input.invalid{border-color:var(--warn)}
+  .field-error{font-size:11px; color:var(--warn); min-height:1.2em; margin-top:3px}
+
+  .slider-row{margin-top:10px}
+  .slider-row label{display:flex; justify-content:space-between; font-size:12px; color:var(--muted); margin-bottom:5px}
+  .slider-row output{font-family:var(--font-mono); color:var(--fg)}
+  input[type="range"]{width:100%; accent-color:var(--accent)}
+
+  .zones-list{display:flex; flex-direction:column; gap:5px}
+  .zone-row{
+    display:flex; align-items:center; gap:8px; padding:6px 8px; border-radius:8px;
+    border:1px solid var(--border); background:var(--surface); cursor:pointer; font-size:12.5px; color:var(--fg); width:100%;
+  }
+  .zone-row[aria-pressed="true"]{border-color:var(--accent); background:var(--surface-2)}
+  .zone-row .chip{width:16px; height:16px; border-radius:4px; flex:none; border:1px solid rgba(0,0,0,.15)}
+  .zone-row .label{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .zone-row .del{border:none; background:none; color:var(--muted); font-size:14px; padding:2px 4px; cursor:pointer}
+  .zone-row .del:hover{color:var(--warn)}
+  .empty-note{font-size:12px; color:var(--muted); padding:4px 2px}
+
+  .ambiance-grid{display:grid; grid-template-columns:1fr 1fr; gap:6px}
+  .amb-btn{border:1px solid var(--border); background:var(--surface); border-radius:7px; padding:8px; font-size:12px; font-weight:600; color:var(--fg); cursor:pointer; text-align:left}
+  .amb-btn[aria-pressed="true"]{border-color:var(--accent); background:var(--surface-2); color:var(--accent)}
+  .amb-btn .sub{display:block; font-weight:400; color:var(--muted); font-size:10px}
+
+  .tip{font-size:11.5px; color:var(--muted); line-height:1.5}
+  footer{text-align:center; font-size:11px; color:var(--muted); padding:6px 0 2px}
+  .sr-only{position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0)}
+  /* -- Grille principale -- */
+  .workspace{display:grid; grid-template-columns:1fr; gap:20px}
+  @media (min-width:900px){
+    .workspace{grid-template-columns:1fr 340px; align-items:start}
+  }
+
+  /* -- Colonne canevas -- */
+  .canvas-col{display:flex; flex-direction:column; gap:12px; min-width:0}
+
+  .toolbar{display:flex; flex-wrap:wrap; gap:8px; align-items:center}
+  .btn{
+    border:1px solid var(--border); background:var(--surface); color:var(--fg);
+    border-radius:8px; padding:9px 14px; font-size:13.5px; font-weight:600;
+    cursor:pointer; display:inline-flex; align-items:center; gap:6px;
+    transition:border-color .15s, background .15s;
+  }
+  .btn:hover{border-color:var(--accent)}
+  .btn:disabled{opacity:.45; cursor:not-allowed}
+  .btn-accent{background:var(--accent); color:var(--accent-ink); border-color:var(--accent)}
+  .btn-ghost{background:transparent}
+  .btn-warn{color:var(--warn); border-color:var(--warn)}
+  .btn-sm{padding:6px 10px; font-size:12.5px}
+
+  .stage-wrap{
+    position:relative; border-radius:14px; overflow:hidden;
+    background:var(--surface-2); border:1px solid var(--border);
+  }
+  .stage-wrap canvas{display:block; width:100%; height:auto; touch-action:none; cursor:default}
+  .stage-wrap.drawing canvas{cursor:crosshair}
+
+  .badge-example{
+    position:absolute; top:10px; left:10px; z-index:2;
+    background:var(--fg); color:var(--bg); font-family:var(--font-mono);
+    font-size:11px; letter-spacing:.08em; text-transform:uppercase;
+    padding:5px 10px; border-radius:999px; opacity:.88;
+  }
+
+  .hint-bar{
+    display:flex; justify-content:space-between; align-items:baseline; gap:12px;
+    font-size:13px; color:var(--muted); flex-wrap:wrap;
+  }
+  .hint-bar strong{color:var(--fg)}
+
+  .confirm-bar{
+    display:none; align-items:center; gap:10px; background:var(--surface-2);
+    border:1px solid var(--border); border-radius:10px; padding:10px 12px; font-size:13px;
+  }
+  .confirm-bar.show{display:flex}
+
+  /* -- Zone de dépôt (état vide) -- */
+  .dropzone{
+    border:2px dashed var(--border); border-radius:14px; padding:48px 20px;
+    display:flex; flex-direction:column; align-items:center; gap:14px;
+    text-align:center; background:var(--surface);
+    transition:border-color .15s, background .15s;
+  }
+  .dropzone.over{border-color:var(--accent); background:var(--surface-2)}
+  .dropzone svg{width:46px; height:46px; color:var(--accent)}
+  .dropzone h2{font-size:18px}
+  .dropzone p{margin:0; color:var(--muted); font-size:13.5px; max-width:36ch}
+  .dropzone .error{color:var(--warn); font-size:13px; font-weight:600; min-height:1.2em}
+
+  /* -- Colonne outils -- */
+  .sidebar{display:flex; flex-direction:column; gap:14px}
+  .panel{
+    background:var(--surface); border:1px solid var(--border); border-radius:12px;
+    padding:14px 14px 16px;
+  }
+  .panel[data-disabled="true"]{opacity:.5; pointer-events:none}
+  .panel-head{display:flex; justify-content:space-between; align-items:baseline; margin-bottom:10px}
+  .panel-head h2{font-size:14px}
+  .panel-head .note{font-size:11.5px; color:var(--muted)}
+
+  .swatches{display:grid; grid-template-columns:repeat(5,1fr); gap:7px}
+  .swatch{
+    border:2px solid transparent; border-radius:8px; padding:0; aspect-ratio:1;
+    cursor:pointer; position:relative; outline-offset:2px;
+  }
+  /* anneau à deux tons (bordure claire + ombre foncée) pour que l'état
+     "sélectionné" reste visible même sur un échantillon de couleur sombre */
+  .swatch[aria-pressed="true"]{border-color:var(--surface); box-shadow:0 0 0 2px var(--fg)}
+  .swatch .code{
+    position:absolute; bottom:2px; left:0; right:0; font-family:var(--font-mono);
+    font-size:8px; text-align:center; color:rgba(0,0,0,.55); letter-spacing:.02em;
+  }
+  .swatch-name{font-size:11px; color:var(--muted); margin-top:6px; text-align:center}
+
+  .custom-row{display:flex; align-items:center; gap:8px; margin-top:12px}
+  .custom-row input[type="color"]{
+    width:34px; height:34px; border-radius:7px; border:1px solid var(--border);
+    padding:0; background:none; cursor:pointer;
+  }
+  .hex-input{
+    flex:1; min-width:0; font-family:var(--font-mono); font-size:13px;
+    border:1px solid var(--border); border-radius:7px; padding:7px 9px;
+    background:var(--surface); color:var(--fg);
+  }
+  .hex-input.invalid{border-color:var(--warn)}
+  .field-error{font-size:11.5px; color:var(--warn); min-height:1.3em; margin-top:3px}
+
+  .slider-row{margin-top:12px}
+  .slider-row label{display:flex; justify-content:space-between; font-size:12.5px; color:var(--muted); margin-bottom:6px}
+  .slider-row output{font-family:var(--font-mono); color:var(--fg)}
+  input[type="range"]{width:100%; accent-color:var(--accent)}
+
+  .zones-list{display:flex; flex-direction:column; gap:6px; margin-top:4px}
+  .zone-item{
+    display:flex; align-items:center; gap:9px; padding:7px 9px; border-radius:8px;
+    border:1px solid var(--border); background:var(--surface); cursor:pointer; text-align:left;
+    font-size:13px; color:var(--fg); width:100%;
+  }
+  .zone-item[aria-pressed="true"]{border-color:var(--accent); background:var(--surface-2)}
+  .zone-item .chip{width:18px; height:18px; border-radius:5px; flex:none; border:1px solid rgba(0,0,0,.15)}
+  .zone-item .label{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .zone-item .hex{font-family:var(--font-mono); font-size:11px; color:var(--muted)}
+  .zone-item .del{
+    border:none; background:none; color:var(--muted); font-size:15px; line-height:1;
+    padding:2px 4px; cursor:pointer; border-radius:5px;
+  }
+  .zone-item .del:hover{color:var(--warn)}
+
+  /* ---------- squelette unifié (écran d'accueil + routage des vues) ---------- */
+  header .back{
+    border:none; background:none; color:var(--fg); width:34px; height:34px; border-radius:50%;
+    display:inline-flex; align-items:center; justify-content:center; cursor:pointer; flex:none;
+  }
+  header .back:hover{background:var(--surface-2)}
+  header .title-group{display:flex; flex-direction:column; flex:1; min-width:0}
+
+  #view-photo, #view-camera{flex:1; min-height:0}
+  #view-camera{display:flex; flex-direction:column}
+  @media (min-width:880px){ #view-camera{flex-direction:row} }
+  #view-photo{overflow-y:auto; padding:16px; padding-block:20px 32px; max-width:1180px; margin-inline:auto; width:100%}
+
+  .view-home{
+    flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:28px; padding:32px 20px; text-align:center; max-width:640px; margin-inline:auto; width:100%;
+  }
+  .home-hero h2{font-size:22px}
+  .home-hero p{margin:8px 0 0; color:var(--muted); font-size:14px; max-width:46ch}
+  .mode-cards{display:grid; grid-template-columns:1fr; gap:14px; width:100%}
+  @media (min-width:560px){ .mode-cards{grid-template-columns:1fr 1fr} }
+  .mode-card{
+    display:flex; flex-direction:column; align-items:center; gap:10px; text-align:center;
+    border:1px solid var(--border); background:var(--surface); border-radius:16px; padding:26px 18px;
+    cursor:pointer; color:var(--fg);
+  }
+  .mode-card:hover{border-color:var(--accent)}
+  .mode-card svg{width:40px; height:40px; color:var(--accent)}
+  .mode-card span{font-family:var(--font-display); font-weight:600; font-size:16px}
+  .mode-card small{color:var(--muted); font-size:12.5px; line-height:1.4}
+  .home-tip{font-size:12px; color:var(--muted); max-width:44ch}
+
+</style>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@500;600&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+<div class="app">
+
+  <header>
+    <button class="back" id="btn-home" type="button" aria-label="Retour à l'accueil" hidden>
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
+    </button>
+    <div class="title-group">
+      <span class="eyebrow">Atelier déco</span>
+      <h1 id="app-title">Nuancier Mural</h1>
+    </div>
+    <span class="live-dot" id="c-live-indicator" hidden><span></span>EN DIRECT</span>
+  </header>
+
+  <main>
+
+    <section id="view-home" class="view view-home">
+      <div class="home-hero">
+        <h2>Choisis un mode</h2>
+        <p>Teste une couleur de peinture sur un mur, soit en direct avec la caméra, soit à partir d'une photo.</p>
+      </div>
+      <div class="mode-cards">
+        <button class="mode-card" id="btn-mode-camera" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 7.5A1.5 1.5 0 0 1 5.5 6h2l1-1.5h7L16.5 6h2A1.5 1.5 0 0 1 20 7.5v10A1.5 1.5 0 0 1 18.5 19h-13A1.5 1.5 0 0 1 4 17.5z"/><circle cx="12" cy="12.5" r="3.4"/></svg>
+          <span>Caméra en direct</span>
+          <small>Vise un mur avec ton téléphone et ajuste la couleur en temps réel.</small>
+        </button>
+        <button class="mode-card" id="btn-mode-photo" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 16.5V5.5A1.5 1.5 0 0 1 5.5 4h13A1.5 1.5 0 0 1 20 5.5v11"/><path d="M4 16.5 9 11l3 3 3-3 5 5.5"/><circle cx="9" cy="8.5" r="1.4"/><path d="M4 18.5h16"/></svg>
+          <span>Depuis une photo</span>
+          <small>Charge une photo de ta pièce et dessine les murs à repeindre.</small>
+        </button>
+      </div>
+      <p class="home-tip">Astuce&nbsp;: dans le menu ⋮ de Chrome, choisis « Ajouter à l'écran d'accueil » pour ouvrir cette page comme une application, avec sa propre icône.</p>
+    </section>
+
+    <section id="view-photo" class="view" hidden>
+  <div class="workspace">
+
+    <!-- ===================== COLONNE CANEVAS ===================== -->
+    <div class="canvas-col">
+
+      <div class="toolbar">
+        <button class="btn btn-accent" id="p-btn-new-zone" type="button">+ Nouvelle zone</button>
+        <button class="btn" id="p-btn-close-zone" type="button" disabled>Fermer la zone</button>
+        <button class="btn btn-ghost btn-sm" id="p-btn-undo-point" type="button" disabled>Annuler le point</button>
+        <button class="btn btn-ghost btn-sm" id="p-btn-cancel-draw" type="button" disabled>Annuler le tracé</button>
+        <button class="btn btn-ghost btn-sm" id="p-btn-new-rect-zone" type="button" title="Crée une zone rectangulaire réglable aux flèches, sans souris ni tactile">+ Zone (clavier)</button>
+        <span style="flex:1"></span>
+        <button class="btn btn-ghost" id="p-btn-change-photo" type="button">Changer de photo</button>
+        <button class="btn" id="p-btn-download" type="button">Télécharger l'image</button>
+      </div>
+
+      <div class="confirm-bar" id="p-confirm-change">
+        <span>Remplacer la photo effacera les zones actuelles. Confirmer ?</span>
+        <button class="btn btn-warn btn-sm" id="p-confirm-yes" type="button">Oui, remplacer</button>
+        <button class="btn btn-ghost btn-sm" id="p-confirm-no" type="button">Annuler</button>
+      </div>
+
+      <div class="stage-wrap" id="p-stage-wrap">
+        <span class="badge-example" id="p-badge-example">Exemple</span>
+        <canvas id="p-canvas" width="1000" height="700" role="img" aria-label="Aperçu de la pièce avec les couleurs appliquées"></canvas>
+      </div>
+
+      <div class="hint-bar" id="p-hint-bar">
+        <span id="p-hint-text">Ceci est une pièce d'exemple. <strong>Charge ta propre photo</strong> pour visualiser ta pièce réelle.</span>
+        <span id="p-zone-counter">2 zones</span>
+      </div>
+
+      <!-- état vide, affiché par-dessus quand aucune image personnelle n'est requise à l'écran -->
+      <div class="dropzone" id="p-dropzone" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 16.5V5.5A1.5 1.5 0 0 1 5.5 4h13A1.5 1.5 0 0 1 20 5.5v11"/><path d="M4 16.5 9 11l3 3 3-3 5 5.5"/><circle cx="9" cy="8.5" r="1.4"/><path d="M4 18.5h16"/></svg>
+        <h2>Dépose une photo de ta pièce</h2>
+        <p>Idéalement une photo bien éclairée, prise de face sur le mur à tester. Formats JPG ou PNG.</p>
+        <button class="btn btn-accent" id="p-btn-pick-file" type="button">Choisir une photo</button>
+        <input type="file" id="p-file-input" accept="image/*" class="sr-only">
+        <p class="error" id="p-upload-error" role="alert"></p>
+      </div>
+
+    </div>
+
+    <!-- ===================== COLONNE OUTILS ===================== -->
+    <aside class="sidebar">
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Couleur active</h2>
+          <span class="note">s'applique à la zone sélectionnée</span>
+        </div>
+        <div class="swatches" id="p-swatches" role="group" aria-label="Palette de couleurs de peinture"></div>
+        <div class="custom-row">
+          <input type="color" id="p-custom-color" value="#8A9A7E" aria-label="Choisir une couleur personnalisée">
+          <input type="text" id="p-hex-input" class="hex-input" value="#8A9A7E" maxlength="7" aria-label="Code hexadécimal">
+        </div>
+        <p class="field-error" id="p-hex-error"></p>
+
+        <div class="slider-row">
+          <label for="p-intensity">Intensité de la teinte <output id="p-intensity-out">50%</output></label>
+          <input type="range" id="p-intensity" min="15" max="90" step="5" value="50">
+        </div>
+      </section>
+
+      <section class="panel" id="p-panel-zones">
+        <div class="panel-head">
+          <h2>Zones peintes</h2>
+        </div>
+        <div class="zones-list" id="p-zones-list"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Ambiance</h2>
+          <span class="note">filtre toute la pièce</span>
+        </div>
+        <div class="ambiance-grid" id="p-ambiance-grid"></div>
+      </section>
+
+      <p class="tip">Astuce de métier&nbsp;: la teinte ici est une approximation (superposition de couleur sur la photo). La lumière, la texture du mur et le fini de peinture (mat, satin) font toujours varier le résultat réel — teste toujours un petit échantillon sur le mur avant d'acheter.<br>Au clavier&nbsp;: utilise « + Zone (clavier) » puis, dans la liste des zones, les flèches pour la déplacer et Maj+flèches pour la redimensionner.</p>
+
+    </aside>
+
+  </div>
+
+    </section>
+
+    <section id="view-camera" class="view" hidden>
+    <div class="stage-col">
+      <div class="stage" id="c-stage">
+
+        <video id="c-video" autoplay playsinline muted></video>
+        <canvas id="c-view" aria-hidden="true"></canvas>
+
+        <div class="start-screen" id="c-start-screen">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 7.5A1.5 1.5 0 0 1 5.5 6h2l1-1.5h7L16.5 6h2A1.5 1.5 0 0 1 20 7.5v10A1.5 1.5 0 0 1 18.5 19h-13A1.5 1.5 0 0 1 4 17.5z"/><circle cx="12" cy="12.5" r="3.4"/></svg>
+          <h2 style="font-size:16px">Activer la caméra</h2>
+          <p>La vidéo reste sur ton appareil — rien n'est envoyé ni enregistré ailleurs. Vise le mur à tester, puis dessine une zone de couleur par-dessus.</p>
+          <button class="btn btn-accent" id="c-btn-start" type="button">Activer la caméra</button>
+          <p style="font-size:11.5px; color:var(--muted); max-width:40ch">Fonctionne dans Chrome, Edge ou Firefox (ordinateur ou Android). Sur iPhone, ouvre ce fichier avec Safari — certains navigateurs mobiles bloquent l'accès caméra pour les fichiers locaux.</p>
+        </div>
+
+        <div class="error-screen" id="c-error-screen" hidden>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>
+          <h2 style="font-size:16px">Caméra indisponible</h2>
+          <p id="c-error-text">—</p>
+          <button class="btn" id="c-btn-retry" type="button">Réessayer</button>
+        </div>
+
+      </div>
+
+      <div class="stage-toolbar">
+        <button class="btn btn-sm" id="c-btn-add-zone" type="button" disabled>+ Zone</button>
+        <button class="btn-icon" id="c-btn-switch-cam" type="button" title="Changer de caméra" disabled>
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M17 2l3 3-3 3M20 5H8a5 5 0 0 0-5 5"/><path d="M7 22l-3-3 3-3M4 19h12a5 5 0 0 0 5-5"/></svg>
+        </button>
+        <button class="btn-icon" id="c-btn-pause" type="button" title="Figer l'image" disabled>
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
+        </button>
+        <span class="spacer"></span>
+        <button class="btn" id="c-btn-capture" type="button" disabled>Capturer l'image</button>
+      </div>
+    </div>
+
+    <aside class="sidebar">
+
+      <section class="panel">
+        <h2>Couleur active <span class="note">— zone sélectionnée</span></h2>
+        <div class="swatches" id="c-swatches" role="group" aria-label="Palette de couleurs"></div>
+        <div class="custom-row">
+          <input type="color" id="c-custom-color" value="#8A9A7E" aria-label="Couleur personnalisée">
+          <input type="text" id="c-hex-input" class="hex-input" value="#8A9A7E" maxlength="7" aria-label="Code hexadécimal">
+        </div>
+        <p class="field-error" id="c-hex-error"></p>
+        <div class="slider-row">
+          <label for="c-intensity">Intensité <output id="c-intensity-out">50%</output></label>
+          <input type="range" id="c-intensity" min="15" max="90" step="5" value="50">
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Zones <span class="note" id="c-zone-counter">0</span></h2>
+        <div class="zones-list" id="c-zones-list"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Ambiance <span class="note">filtre vidéo</span></h2>
+        <div class="ambiance-grid" id="c-ambiance-grid"></div>
+      </section>
+
+      <p class="tip">Déplace et redimensionne la zone colorée par les coins pour la caler sur le mur visé — la caméra ne détecte pas le mur automatiquement, c'est à toi de l'ajuster en bougeant le téléphone ou la zone. Au clavier : sélectionne une zone dans la liste, puis flèches pour la déplacer, Maj+flèches pour la redimensionner.</p>
+
+      <footer>© 2026 Will — Tous droits réservés.</footer>
+    </aside>
+  
+    </section>
+
+  </main>
+</div>
+<script>(function(){
+  "use strict";
+
+  /* ---------------------------------------------------------------
+     Référentiel de couleurs — un petit nuancier avec des noms et des
+     codes comme un vrai carnet de teintes de peintre.
+  ----------------------------------------------------------------*/
+  const SWATCHES = [
+    { code:'P-01', name:'Blanc Craie',     hex:'#EFEDE4' },
+    { code:'P-02', name:'Gris Perle',      hex:'#C7CBC6' },
+    { code:'P-03', name:'Anthracite',      hex:'#3A3F42' },
+    { code:'P-04', name:'Bleu Pétrole',    hex:'#1F6F78' },
+    { code:'P-05', name:'Bleu Nuit',       hex:'#263449' },
+    { code:'P-06', name:'Vert Sauge',      hex:'#8A9A7E' },
+    { code:'P-07', name:'Vert Olivier',    hex:'#5A6B48' },
+    { code:'P-08', name:'Jaune Moutarde',  hex:'#C98A2B' },
+    { code:'P-09', name:'Terracotta',      hex:'#B5603C' },
+    { code:'P-10', name:'Rose Poudré',     hex:'#D9B8B0' },
+  ];
+
+  const AMBIANCES = [
+    { id:'aucune',     label:'Aucune',       sub:'photo originale',     filter:'none' },
+    { id:'scandinave', label:'Scandinave',   sub:'clair, doux',         filter:'brightness(1.08) saturate(0.82) contrast(1.02)' },
+    { id:'industriel', label:'Industriel',   sub:'contrasté, brut',     filter:'contrast(1.18) saturate(0.7) brightness(0.92)' },
+    { id:'cosy',       label:'Cosy',         sub:'chaleureux',          filter:'brightness(1.05) saturate(1.15) sepia(0.12) contrast(1.03)' },
+    { id:'moderne',    label:'Moderne',      sub:'net, franc',          filter:'contrast(1.1) saturate(1.05)' },
+    { id:'minimal',    label:'Minimaliste',  sub:'sobre, mat',          filter:'saturate(0.55) brightness(1.1) contrast(0.97)' },
+  ];
+
+  /* ---------------------------------------------------------------
+     État de l'application
+  ----------------------------------------------------------------*/
+  const state = {
+    img: null,            // image courante (Image) dessinée dans le canevas
+    isExample: true,      // vrai tant que la pièce affichée est la pièce de démonstration
+    zones: [],            // { id, label, rings:[[{x,y}..]], color, intensity }
+    nextZoneNum: 1,
+    drawing: false,
+    currentPoints: [],
+    selectedZoneId: null,
+    activeColor: '#8A9A7E',
+    activeIntensity: 0.5,
+    ambiance: 'aucune',
+  };
+
+  /* ---------------------------------------------------------------
+     Raccourcis DOM
+  ----------------------------------------------------------------*/
+  const $ = (id) => document.getElementById(id);
+  const canvas = $('p-canvas');
+  const ctx = canvas.getContext('2d');
+  const stageWrap = $('p-stage-wrap');
+
+  /* =================================================================
+     1. Pièce d'exemple — dessinée en code, pas une vraie photo, pour
+        que l'outil montre tout de suite ce qu'il fait avant que
+        l'utilisateur ne charge sa propre pièce.
+  ==================================================================*/
+  function buildExampleRoom(){
+    const off = document.createElement('canvas');
+    off.width = 1000; off.height = 700;
+    const c = off.getContext('2d');
+
+    // sol
+    c.fillStyle = '#B48B5E';
+    c.fillRect(0, 548, 1000, 152);
+    // mur latéral (pan dans la pénombre, à gauche)
+    c.fillStyle = '#D6D3C7';
+    c.fillRect(0, 0, 180, 548);
+    // mur du fond
+    c.fillStyle = '#E7E4D8';
+    c.fillRect(180, 0, 820, 548);
+    // plinthe
+    c.fillStyle = '#33373A';
+    c.fillRect(0, 538, 1000, 12);
+    // cadre tableau
+    c.fillStyle = '#FFFFFF';
+    c.fillRect(255, 150, 175, 175);
+    c.fillStyle = '#9CAD8E';
+    c.fillRect(267, 162, 151, 151);
+    // fenêtre
+    c.fillStyle = '#FFFFFF';
+    c.fillRect(545, 115, 270, 275);
+    c.fillStyle = '#CFE3EC';
+    c.fillRect(560, 130, 240, 245);
+    c.fillStyle = '#FFFFFF';
+    c.fillRect(555, 245, 260, 12);
+    c.fillRect(675, 125, 12, 255);
+    // ombre douce au sol près du mur latéral
+    const grad = c.createLinearGradient(180, 0, 260, 0);
+    grad.addColorStop(0, 'rgba(0,0,0,0.12)');
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    c.fillStyle = grad;
+    c.fillRect(180, 0, 80, 548);
+
+    return off;
+  }
+
+  function loadExampleRoom(){
+    state.img = buildExampleRoom();
+    state.isExample = true;
+    state.zones = [
+      {
+        id:'ex-fond', label:'Mur du fond',
+        rings:[
+          [{x:180,y:0},{x:1000,y:0},{x:1000,y:538},{x:180,y:538}],
+          [{x:545,y:115},{x:815,y:115},{x:815,y:390},{x:545,y:390}], // fenêtre (trou)
+          [{x:255,y:150},{x:430,y:150},{x:430,y:325},{x:255,y:325}], // tableau (trou)
+        ],
+        color:'#8A9A7E', intensity:0.5,
+      },
+      {
+        id:'ex-lateral', label:'Mur latéral',
+        rings:[ [{x:0,y:0},{x:180,y:0},{x:180,y:538},{x:0,y:538}] ],
+        color:'#8A9A7E', intensity:0.62,
+      },
+    ];
+    state.nextZoneNum = 1;
+    finishLoadingImage();
+  }
+
+  /* =================================================================
+     2. Chargement d'une photo personnelle
+  ==================================================================*/
+  const MAX_DIM = 1600; // on limite la résolution interne pour rester fluide
+
+  function handleFile(file){
+    const errEl = $('p-upload-error');
+    errEl.textContent = '';
+    if (!file) return;
+    if (!file.type || !file.type.startsWith('image/')) {
+      errEl.textContent = "Ce fichier n'est pas une image. Choisis un JPG ou un PNG.";
+      return;
+    }
+    // une photo de smartphone récent peut peser plusieurs dizaines de Mo :
+    // on affiche un état de traitement pour ne pas donner l'impression d'un blocage.
+    $('p-hint-text').textContent = 'Traitement de l’image…';
+    const reader = new FileReader();
+    reader.onerror = function(){
+      errEl.textContent = "La lecture du fichier a échoué. Réessaie.";
+      updateHintBar();
+    };
+    reader.onload = function(ev){
+      const im = new Image();
+      im.onerror = function(){
+        errEl.textContent = "Impossible d'ouvrir cette image. Essaie un autre fichier.";
+        updateHintBar();
+      };
+      im.onload = function(){
+        const off = document.createElement('canvas');
+        let w = im.naturalWidth, h = im.naturalHeight;
+        if (w === 0 || h === 0){
+          errEl.textContent = "Cette image semble vide ou corrompue.";
+          updateHintBar();
+          return;
+        }
+        const scale = Math.min(1, MAX_DIM / Math.max(w, h));
+        off.width = Math.round(w * scale);
+        off.height = Math.round(h * scale);
+        off.getContext('2d').drawImage(im, 0, 0, off.width, off.height);
+
+        state.img = off;
+        state.isExample = false;
+        state.zones = [];
+        state.nextZoneNum = 1;
+        state.selectedZoneId = null;
+        stopDrawing();
+        finishLoadingImage();
+      };
+      im.src = ev.target.result;
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function finishLoadingImage(){
+    canvas.width = state.img.width;
+    canvas.height = state.img.height;
+    $('p-dropzone').hidden = true;
+    $('p-badge-example').style.display = state.isExample ? '' : 'none';
+    updateHintBar();
+    renderZonesList();
+    render();
+  }
+
+  /* =================================================================
+     3. Dessin des zones (polygones cliqués par l'utilisateur)
+  ==================================================================*/
+  function canvasPointFromEvent(ev){
+    const rect = canvas.getBoundingClientRect();
+    const sx = canvas.width / rect.width;
+    const sy = canvas.height / rect.height;
+    const clientX = ev.touches ? ev.touches[0].clientX : ev.clientX;
+    const clientY = ev.touches ? ev.touches[0].clientY : ev.clientY;
+    return { x:(clientX - rect.left) * sx, y:(clientY - rect.top) * sy };
+  }
+
+  function startDrawing(){
+    if (!state.img) return;
+    state.drawing = true;
+    state.currentPoints = [];
+    state.selectedZoneId = null;
+    stageWrap.classList.add('drawing');
+    $('p-btn-new-zone').disabled = true;
+    $('p-btn-new-rect-zone').disabled = true;
+    $('p-btn-close-zone').disabled = true;
+    $('p-btn-undo-point').disabled = true;
+    $('p-btn-cancel-draw').disabled = false;
+    $('p-hint-text').innerHTML = 'Clique pour placer les points du contour du mur (3 minimum), puis <strong>Fermer la zone</strong>.';
+    renderZonesList();
+    render();
+  }
+
+  function stopDrawing(){
+    state.drawing = false;
+    state.currentPoints = [];
+    stageWrap.classList.remove('drawing');
+    $('p-btn-new-zone').disabled = !state.img;
+    $('p-btn-new-rect-zone').disabled = !state.img;
+    $('p-btn-close-zone').disabled = true;
+    $('p-btn-undo-point').disabled = true;
+    $('p-btn-cancel-draw').disabled = true;
+    updateHintBar();
+  }
+
+  function closeZone(){
+    if (state.currentPoints.length < 3) return;
+    const id = 'z' + Date.now();
+    const zone = {
+      id,
+      label: 'Mur ' + state.nextZoneNum++,
+      rings: [ state.currentPoints.slice() ],
+      color: state.activeColor,
+      intensity: state.activeIntensity,
+    };
+    state.zones.push(zone);
+    state.selectedZoneId = id;
+    stopDrawing();
+    renderZonesList();
+    render();
+  }
+
+  // Zone rectangulaire créée et réglable entièrement au clavier (flèches
+  // pour la déplacer, Maj+flèches pour la redimensionner) — alternative
+  // au tracé libre à la souris/au doigt, qui n'a pas d'équivalent clavier.
+  function rectRings(x, y, w, h){
+    const x0 = x * canvas.width, y0 = y * canvas.height;
+    const x1 = (x + w) * canvas.width, y1 = (y + h) * canvas.height;
+    return [[{x:x0,y:y0},{x:x1,y:y0},{x:x1,y:y1},{x:x0,y:y1}]];
+  }
+
+  function addRectZone(){
+    if (!state.img) return;
+    const id = 'z' + Date.now();
+    const zone = {
+      id, kind:'rect',
+      label: 'Mur ' + state.nextZoneNum++,
+      x:0.3, y:0.3, w:0.4, h:0.4,
+      color: state.activeColor, intensity: state.activeIntensity,
+    };
+    zone.rings = rectRings(zone.x, zone.y, zone.w, zone.h);
+    state.zones.push(zone);
+    state.selectedZoneId = id;
+    renderZonesList();
+    render();
+    // place le focus sur la nouvelle zone pour l'ajuster aux flèches tout de suite
+    const el = $('p-zones-list').querySelector('[data-zone-id="' + id + '"]');
+    if (el) el.focus();
+  }
+  $('p-btn-new-rect-zone').addEventListener('click', addRectZone);
+
+  canvas.addEventListener('pointerdown', function(ev){
+    if (!state.drawing) return;
+    ev.preventDefault();
+    const p = canvasPointFromEvent(ev);
+    // clic proche du premier point -> fermeture rapide
+    if (state.currentPoints.length >= 3) {
+      const first = state.currentPoints[0];
+      const d = Math.hypot(p.x - first.x, p.y - first.y);
+      if (d < canvas.width * 0.035) { closeZone(); return; } // tolérance élargie (doigt/gant)
+    }
+    state.currentPoints.push(p);
+    $('p-btn-undo-point').disabled = state.currentPoints.length === 0;
+    $('p-btn-close-zone').disabled = state.currentPoints.length < 3;
+    render();
+  });
+
+  $('p-btn-new-zone').addEventListener('click', startDrawing);
+  $('p-btn-close-zone').addEventListener('click', closeZone);
+  $('p-btn-cancel-draw').addEventListener('click', stopDrawing);
+  $('p-btn-undo-point').addEventListener('click', function(){
+    state.currentPoints.pop();
+    $('p-btn-undo-point').disabled = state.currentPoints.length === 0;
+    $('p-btn-close-zone').disabled = state.currentPoints.length < 3;
+    render();
+  });
+
+  /* =================================================================
+     4. Rendu — image de base + teinte « peinture » sur chaque zone
+  ==================================================================*/
+  function paintZone(zone){
+    ctx.save();
+    const path = new Path2D();
+    zone.rings.forEach(function(ring){
+      ring.forEach(function(pt, i){
+        if (i === 0) path.moveTo(pt.x, pt.y); else path.lineTo(pt.x, pt.y);
+      });
+      path.closePath();
+    });
+    ctx.clip(path, 'evenodd');
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.globalAlpha = zone.intensity;
+    ctx.fillStyle = zone.color;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.restore();
+  }
+
+  function render(){
+    if (!state.img) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(state.img, 0, 0, canvas.width, canvas.height);
+    state.zones.forEach(paintZone);
+
+    // tracé en cours (guide visuel, non teinté)
+    if (state.drawing && state.currentPoints.length){
+      ctx.save();
+      ctx.strokeStyle = 'rgba(31,111,120,0.95)';
+      ctx.fillStyle = 'rgba(31,111,120,0.95)';
+      ctx.lineWidth = Math.max(2, canvas.width * 0.0025);
+      ctx.setLineDash([8, 6]);
+      ctx.beginPath();
+      state.currentPoints.forEach(function(pt, i){
+        if (i === 0) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y);
+      });
+      ctx.stroke();
+      ctx.setLineDash([]);
+      state.currentPoints.forEach(function(pt, i){
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, Math.max(4, canvas.width * 0.006), 0, Math.PI * 2);
+        ctx.fill();
+        if (i === 0){
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = '#fff';
+          ctx.stroke();
+        }
+      });
+      ctx.restore();
+    }
+
+    canvas.style.filter = (AMBIANCES.find(a => a.id === state.ambiance) || AMBIANCES[0]).filter;
+  }
+
+  /* =================================================================
+     5. Panneau couleurs (palette + couleur personnalisée + intensité)
+  ==================================================================*/
+  function buildSwatches(){
+    const wrap = $('p-swatches');
+    wrap.innerHTML = '';
+    SWATCHES.forEach(function(s){
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'swatch';
+      b.style.background = s.hex;
+      b.setAttribute('aria-pressed', 'false');
+      b.setAttribute('aria-label', s.name + ' ' + s.code + ' ' + s.hex);
+      b.title = s.name + ' — ' + s.code;
+      b.innerHTML = '<span class="code">' + s.code + '</span>';
+      b.addEventListener('click', function(){ setActiveColor(s.hex); });
+      wrap.appendChild(b);
+    });
+  }
+
+  function syncSwatchSelection(){
+    const buttons = $('p-swatches').querySelectorAll('.swatch');
+    buttons.forEach(function(b, i){
+      b.setAttribute('aria-pressed', String(SWATCHES[i].hex.toLowerCase() === state.activeColor.toLowerCase()));
+    });
+  }
+
+  function isValidHex(v){ return /^#[0-9a-fA-F]{6}$/.test(v); }
+
+  function setActiveColor(hex, fromHexField){
+    state.activeColor = hex;
+    $('p-custom-color').value = hex;
+    if (!fromHexField) $('p-hex-input').value = hex;
+    $('p-hex-input').classList.remove('invalid');
+    $('p-hex-error').textContent = '';
+    syncSwatchSelection();
+    applyActiveToSelectedZone();
+  }
+
+  function applyActiveToSelectedZone(){
+    const zone = state.zones.find(z => z.id === state.selectedZoneId);
+    if (zone){
+      zone.color = state.activeColor;
+      zone.intensity = state.activeIntensity;
+      renderZonesList();
+    }
+    render();
+  }
+
+  $('p-custom-color').addEventListener('input', function(){ setActiveColor(this.value); });
+  $('p-hex-input').addEventListener('input', function(){
+    const v = this.value.trim();
+    if (isValidHex(v)){
+      setActiveColor(v, true);
+    } else {
+      this.classList.add('invalid');
+      $('p-hex-error').textContent = v === '' ? '' : 'Code invalide — format attendu : #1F6F78';
+    }
+  });
+
+  $('p-intensity').addEventListener('input', function(){
+    state.activeIntensity = Number(this.value) / 100;
+    $('p-intensity-out').textContent = this.value + '%';
+    applyActiveToSelectedZone();
+  });
+
+  /* =================================================================
+     6. Liste des zones
+  ==================================================================*/
+  function renderZonesList(){
+    const wrap = $('p-zones-list');
+    wrap.innerHTML = '';
+    $('p-zone-counter').textContent = state.zones.length + (state.zones.length === 1 ? ' zone' : ' zones');
+
+    if (!state.zones.length){
+      const p = document.createElement('p');
+      p.className = 'empty-note';
+      p.textContent = state.drawing
+        ? 'Place les points du contour sur le canevas…'
+        : 'Aucune zone pour l’instant. Clique sur « Nouvelle zone » pour commencer.';
+      wrap.appendChild(p);
+      return;
+    }
+
+    state.zones.forEach(function(zone){
+      // div[role="button"] plutôt qu'un <button> : un bouton ne doit pas
+      // contenir un autre élément interactif (le bouton « supprimer »),
+      // sinon le lecteur d'écran annonce un intitulé confus.
+      const row = document.createElement('div');
+      row.className = 'zone-item';
+      row.setAttribute('role', 'button');
+      row.tabIndex = 0;
+      row.setAttribute('data-zone-id', zone.id);
+      row.setAttribute('aria-pressed', String(zone.id === state.selectedZoneId));
+      row.setAttribute('aria-label', zone.label + (zone.kind === 'rect' ? ' — flèches pour déplacer, Maj+flèches pour redimensionner' : ''));
+      row.innerHTML =
+        '<span class="chip" style="background:' + zone.color + '"></span>' +
+        '<span class="label">' + zone.label + '</span>' +
+        '<span class="hex">' + zone.color.toUpperCase() + '</span>' +
+        '<button type="button" class="del" aria-label="Supprimer ' + zone.label + '" data-del="' + zone.id + '">×</button>';
+      row.addEventListener('click', function(ev){
+        if (ev.target.closest('[data-del]')) return;
+        selectZone(zone.id);
+      });
+      row.addEventListener('keydown', function(ev){
+        if (ev.target !== row) return; // laisse le bouton "del" géré nativement
+        if (ev.key === 'Enter' || ev.key === ' '){
+          ev.preventDefault();
+          selectZone(zone.id);
+          return;
+        }
+        if (zone.kind !== 'rect') return; // le tracé libre n'a pas de coordonnées x/y/w/h à ajuster
+        const STEP = 0.02, MIN = 0.06;
+        const arrows = { ArrowUp:[0,-1], ArrowDown:[0,1], ArrowLeft:[-1,0], ArrowRight:[1,0] };
+        if (!arrows[ev.key]) return;
+        ev.preventDefault();
+        const [dx, dy] = arrows[ev.key];
+        if (ev.shiftKey){
+          zone.w = Math.min(Math.max(zone.w + dx * STEP, MIN), 1 - zone.x);
+          zone.h = Math.min(Math.max(zone.h + dy * STEP, MIN), 1 - zone.y);
+        } else {
+          zone.x = Math.min(Math.max(zone.x + dx * STEP, 0), 1 - zone.w);
+          zone.y = Math.min(Math.max(zone.y + dy * STEP, 0), 1 - zone.h);
+        }
+        zone.rings = rectRings(zone.x, zone.y, zone.w, zone.h);
+        render();
+      });
+      row.querySelector('[data-del]').addEventListener('click', function(ev){
+        ev.stopPropagation();
+        deleteZone(zone.id);
+      });
+      wrap.appendChild(row);
+    });
+  }
+
+  function selectZone(id){
+    state.selectedZoneId = id;
+    const zone = state.zones.find(z => z.id === id);
+    if (zone){
+      state.activeColor = zone.color;
+      state.activeIntensity = zone.intensity;
+      $('p-custom-color').value = zone.color;
+      $('p-hex-input').value = zone.color;
+      $('p-hex-input').classList.remove('invalid');
+      $('p-hex-error').textContent = '';
+      $('p-intensity').value = Math.round(zone.intensity * 100);
+      $('p-intensity-out').textContent = Math.round(zone.intensity * 100) + '%';
+      syncSwatchSelection();
+    }
+    renderZonesList();
+    render();
+  }
+
+  function deleteZone(id){
+    state.zones = state.zones.filter(z => z.id !== id);
+    if (state.selectedZoneId === id) state.selectedZoneId = null;
+    renderZonesList();
+    render();
+  }
+
+  /* =================================================================
+     7. Ambiances (filtres visuels sur toute la pièce)
+  ==================================================================*/
+  function buildAmbianceButtons(){
+    const wrap = $('p-ambiance-grid');
+    wrap.innerHTML = '';
+    AMBIANCES.forEach(function(a){
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'amb-btn';
+      b.setAttribute('aria-pressed', String(a.id === state.ambiance));
+      b.innerHTML = a.label + '<span class="sub">' + a.sub + '</span>';
+      b.addEventListener('click', function(){
+        state.ambiance = a.id;
+        wrap.querySelectorAll('.amb-btn').forEach(function(btn, i){
+          btn.setAttribute('aria-pressed', String(AMBIANCES[i].id === a.id));
+        });
+        render();
+      });
+      wrap.appendChild(b);
+    });
+  }
+
+  /* =================================================================
+     8. Barre d'indication + changement de photo
+  ==================================================================*/
+  function updateHintBar(){
+    $('p-hint-text').innerHTML = state.isExample
+      ? 'Ceci est une pièce d’exemple. <strong>Charge ta propre photo</strong> pour visualiser ta pièce réelle.'
+      : 'Clique sur une zone pour la modifier, ou crée une nouvelle zone pour un autre mur.';
+  }
+
+  $('p-btn-change-photo').addEventListener('click', function(){
+    if (state.zones.length === 0){
+      $('p-file-input').click();
+    } else {
+      $('p-confirm-change').classList.add('show');
+    }
+  });
+  $('p-confirm-yes').addEventListener('click', function(){
+    $('p-confirm-change').classList.remove('show');
+    $('p-file-input').click();
+  });
+  $('p-confirm-no').addEventListener('click', function(){
+    $('p-confirm-change').classList.remove('show');
+  });
+
+  $('p-btn-pick-file').addEventListener('click', function(){ $('p-file-input').click(); });
+  $('p-file-input').addEventListener('change', function(){
+    if (this.files && this.files[0]) handleFile(this.files[0]);
+    this.value = '';
+  });
+
+  const dropzone = $('p-dropzone');
+  ['dragenter','dragover'].forEach(function(evt){
+    dropzone.addEventListener(evt, function(e){ e.preventDefault(); dropzone.classList.add('over'); });
+    stageWrap.addEventListener(evt, function(e){ e.preventDefault(); });
+  });
+  ['dragleave','drop'].forEach(function(evt){
+    dropzone.addEventListener(evt, function(e){ e.preventDefault(); dropzone.classList.remove('over'); });
+  });
+  dropzone.addEventListener('drop', function(e){
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) handleFile(f);
+  });
+  // on permet aussi de déposer une photo directement sur le canevas pour la remplacer
+  stageWrap.addEventListener('drop', function(e){
+    e.preventDefault();
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) handleFile(f);
+  });
+
+  /* =================================================================
+     9. Téléchargement de l'image finale
+  ==================================================================*/
+  $('p-btn-download').addEventListener('click', async function(){
+    const btn = this;
+    const original = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Préparation…';
+    try {
+      const downloads = await window.claude?.use?.('downloads');
+      if (!downloads) {
+        btn.textContent = 'Indisponible ici';
+        setTimeout(function(){ btn.textContent = original; btn.disabled = false; }, 1800);
+        return;
+      }
+      // on recompose un canevas qui inclut aussi le filtre d'ambiance,
+      // puisque celui-ci n'est appliqué qu'en CSS à l'écran
+      const out = document.createElement('canvas');
+      out.width = canvas.width; out.height = canvas.height;
+      const octx = out.getContext('2d');
+      octx.filter = canvas.style.filter || 'none';
+      octx.drawImage(canvas, 0, 0);
+
+      out.toBlob(async function(blob){
+        if (!blob){
+          btn.textContent = 'Échec';
+          setTimeout(function(){ btn.textContent = original; btn.disabled = false; }, 1800);
+          return;
+        }
+        try {
+          const res = await downloads.save({ filename:'nuancier-mural.png', data: blob });
+          btn.textContent = res.status === 'saved' ? 'Enregistré ✓' : 'Transmis ✓';
+        } catch (err){
+          btn.textContent = (err && err.code === 'declined') ? 'Annulé' : 'Échec';
+        }
+        setTimeout(function(){ btn.textContent = original; btn.disabled = false; }, 1800);
+      }, 'image/png');
+    } catch (err){
+      btn.textContent = 'Échec';
+      setTimeout(function(){ btn.textContent = original; btn.disabled = false; }, 1800);
+    }
+  });
+
+  /* =================================================================
+     10. Démarrage
+  ==================================================================*/
+  buildSwatches();
+  buildAmbianceButtons();
+  syncSwatchSelection();
+  loadExampleRoom();
+})();
+</script>
+<script>(function(){
+  "use strict";
+
+  const SWATCHES = [
+    { hex:'#EFEDE4' }, { hex:'#C7CBC6' }, { hex:'#3A3F42' }, { hex:'#1F6F78' }, { hex:'#263449' },
+    { hex:'#8A9A7E' }, { hex:'#5A6B48' }, { hex:'#C98A2B' }, { hex:'#B5603C' }, { hex:'#D9B8B0' },
+  ];
+  const AMBIANCES = [
+    { id:'aucune',     label:'Aucune',      sub:'direct',        filter:'none' },
+    { id:'scandinave', label:'Scandinave',  sub:'clair, doux',   filter:'brightness(1.08) saturate(0.82) contrast(1.02)' },
+    { id:'industriel', label:'Industriel',  sub:'contrasté',     filter:'contrast(1.18) saturate(0.7) brightness(0.92)' },
+    { id:'cosy',       label:'Cosy',        sub:'chaleureux',    filter:'brightness(1.05) saturate(1.15) sepia(0.12) contrast(1.03)' },
+    { id:'moderne',    label:'Moderne',     sub:'net, franc',    filter:'contrast(1.1) saturate(1.05)' },
+    { id:'minimal',    label:'Minimaliste', sub:'sobre',         filter:'saturate(0.55) brightness(1.1) contrast(0.97)' },
+  ];
+
+  const $ = (id) => document.getElementById(id);
+  const video = $('c-video');
+  const stage = $('c-stage');
+  const view = $('c-view');
+  const vctx = view.getContext('2d');
+
+  const state = {
+    stream: null,
+    devices: [],
+    deviceIndex: 0,
+    facingMode: 'environment',
+    mirrored: false,
+    paused: false,
+    rafId: null,
+    zones: [],          // { id, label, x,y,w,h (0..1), color, intensity, el, handles }
+    nextNum: 1,
+    selectedId: null,
+    activeColor: '#8A9A7E',
+    activeIntensity: 0.5,
+    ambiance: 'aucune',
+  };
+
+  /* ================= 0. Boucle de rendu (vidéo + teinte -> canevas) =================
+     La vidéo n'est jamais affichée directement : on la redessine à chaque
+     image sur un <canvas>, ce qui permet d'y appliquer la teinte des zones
+     en pixels (ctx.globalCompositeOperation) — un rendu CSS classique
+     (mix-blend-mode par-dessus <video>) ne fonctionne pas de façon fiable
+     dans les navigateurs. */
+  function resizeViewIfNeeded(){
+    const rect = stage.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = Math.max(1, Math.round(rect.width * dpr));
+    const h = Math.max(1, Math.round(rect.height * dpr));
+    if (view.width !== w || view.height !== h){ view.width = w; view.height = h; }
+  }
+
+  function drawFrame(){
+    if (video.readyState >= 2 && video.videoWidth && video.videoHeight){
+      resizeViewIfNeeded();
+      const cw = view.width, ch = view.height;
+      const vw = video.videoWidth, vh = video.videoHeight;
+      // recadrage façon "object-fit:cover" : on ne garde que la portion de
+      // la vidéo qui remplit le canevas, sans la déformer
+      const videoRatio = vw / vh, canvasRatio = cw / ch;
+      let sx, sy, sw, sh;
+      if (videoRatio > canvasRatio){ sh = vh; sw = vh * canvasRatio; sx = (vw - sw) / 2; sy = 0; }
+      else { sw = vw; sh = vw / canvasRatio; sx = 0; sy = (vh - sh) / 2; }
+
+      vctx.save();
+      vctx.filter = (AMBIANCES.find(a => a.id === state.ambiance) || AMBIANCES[0]).filter;
+      if (state.mirrored){ vctx.translate(cw, 0); vctx.scale(-1, 1); }
+      vctx.drawImage(video, sx, sy, sw, sh, 0, 0, cw, ch);
+      vctx.restore();
+
+      vctx.filter = 'none';
+      state.zones.forEach(function(zone){
+        vctx.save();
+        vctx.globalCompositeOperation = 'multiply';
+        vctx.globalAlpha = zone.intensity;
+        vctx.fillStyle = zone.color;
+        vctx.fillRect(zone.x * cw, zone.y * ch, zone.w * cw, zone.h * ch);
+        vctx.restore();
+      });
+    }
+    state.rafId = requestAnimationFrame(drawFrame);
+  }
+  function startRenderLoop(){ if (state.rafId === null) state.rafId = requestAnimationFrame(drawFrame); }
+  function stopRenderLoop(){ if (state.rafId !== null){ cancelAnimationFrame(state.rafId); state.rafId = null; } }
+
+  /* ================= 1. Démarrage caméra ================= */
+  async function startCamera(deviceId, isFallback){
+    hideError();
+    try {
+      if (state.stream) state.stream.getTracks().forEach(t => t.stop());
+      const constraints = deviceId
+        ? { video: { deviceId: { exact: deviceId } }, audio:false }
+        : isFallback
+          ? { video: true, audio:false } // plus aucune contrainte : on prend la première caméra disponible
+          : { video: { facingMode: state.facingMode }, audio:false };
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+      } catch (innerErr){
+        // sur un ordinateur sans caméra arrière, la contrainte facingMode peut
+        // échouer : on retente une seule fois sans contrainte avant d'abandonner.
+        if (!isFallback && !deviceId && (innerErr.name === 'OverconstrainedError' || innerErr.name === 'NotFoundError')){
+          return startCamera(undefined, true);
+        }
+        throw innerErr;
+      }
+      state.stream = stream;
+      video.srcObject = stream;
+      await video.play();
+
+      const track = stream.getVideoTracks()[0];
+      const settings = track.getSettings ? track.getSettings() : {};
+      state.mirrored = settings.facingMode === 'user';
+
+      // certains navigateurs coupent le flux sans prévenir (appli mise en
+      // arrière-plan, caméra débranchée) — sans ça, l'écran restait figé
+      // sur la dernière image sans aucune indication.
+      track.addEventListener('ended', function(){
+        if (state.stream !== stream) return; // un flux plus récent a déjà pris le relais
+        stopRenderLoop();
+        showError({ name:'StreamEnded' });
+        $('c-live-indicator').hidden = true;
+        $('c-btn-add-zone').disabled = true;
+        $('c-btn-switch-cam').disabled = true;
+        $('c-btn-pause').disabled = true;
+        $('c-btn-capture').disabled = true;
+      });
+
+      $('c-start-screen').hidden = true;
+      $('c-live-indicator').hidden = false;
+      $('c-btn-add-zone').disabled = false;
+      $('c-btn-switch-cam').disabled = false;
+      $('c-btn-pause').disabled = false;
+      $('c-btn-capture').disabled = false;
+      startRenderLoop();
+
+      // liste des caméras disponibles, une fois l'autorisation accordée
+      try {
+        const list = await navigator.mediaDevices.enumerateDevices();
+        state.devices = list.filter(d => d.kind === 'videoinput');
+      } catch(e){ state.devices = []; }
+
+    } catch (err){
+      showError(err);
+    }
+  }
+
+  function showError(err){
+    const map = {
+      NotAllowedError: "L'accès à la caméra a été refusé. Autorise-le dans les réglages du navigateur pour ce fichier, puis réessaie.",
+      NotFoundError: "Aucune caméra détectée sur cet appareil.",
+      NotReadableError: "La caméra est déjà utilisée par une autre application.",
+      OverconstrainedError: "Aucune caméra ne correspond aux critères demandés, même après une nouvelle tentative.",
+      SecurityError: "L'accès caméra est bloqué dans ce contexte (certains navigateurs mobiles l'interdisent pour les fichiers locaux).",
+      StreamEnded: "Le flux de la caméra s'est arrêté (mise en arrière-plan, caméra débranchée…). Réactive-la pour continuer.",
+    };
+    $('c-error-text').textContent = map[err && err.name] || ("Impossible d'accéder à la caméra (" + ((err && err.message) || 'erreur inconnue') + ").");
+    $('c-start-screen').hidden = true;
+    $('c-error-screen').hidden = false;
+  }
+  function hideError(){ $('c-error-screen').hidden = true; }
+
+  $('c-btn-start').addEventListener('click', function(){ startCamera(); });
+  $('c-btn-retry').addEventListener('click', function(){ $('c-error-screen').hidden = true; $('c-start-screen').hidden = false; });
+
+  $('c-btn-switch-cam').addEventListener('click', function(){
+    if (state.devices.length > 1){
+      state.deviceIndex = (state.deviceIndex + 1) % state.devices.length;
+      startCamera(state.devices[state.deviceIndex].deviceId);
+    } else {
+      state.facingMode = state.facingMode === 'environment' ? 'user' : 'environment';
+      startCamera();
+    }
+  });
+
+  $('c-btn-pause').addEventListener('click', function(){
+    state.paused = !state.paused;
+    if (state.paused) video.pause(); else video.play();
+    this.style.color = state.paused ? 'var(--accent)' : '';
+  });
+
+  /* ================= 2. Zones (rectangles déplaçables) ================= */
+  function addZone(){
+    const id = 'z' + Date.now();
+    const zone = {
+      id, label:'Zone ' + state.nextNum++,
+      x:0.28, y:0.3, w:0.44, h:0.4,
+      color: state.activeColor, intensity: state.activeIntensity,
+    };
+    buildZoneDom(zone);
+    state.zones.push(zone);
+    selectZone(id);
+    renderZonesList();
+  }
+
+  function buildZoneDom(zone){
+    const el = document.createElement('div');
+    el.className = 'zone-el';
+    el.innerHTML =
+      '<span class="zone-tag">' + zone.label + '</span>' +
+      '<span class="handle nw" data-corner="nw"></span>' +
+      '<span class="handle ne" data-corner="ne"></span>' +
+      '<span class="handle sw" data-corner="sw"></span>' +
+      '<span class="handle se" data-corner="se"></span>';
+    stage.appendChild(el);
+    zone.el = el;
+    applyZoneStyle(zone);
+
+    el.addEventListener('pointerdown', function(ev){
+      if (ev.target.classList.contains('handle')) return; // géré séparément
+      ev.preventDefault();
+      selectZone(zone.id);
+      startDrag(ev, function(dx, dy){
+        const rect = stage.getBoundingClientRect();
+        zone.x = clamp(zone.x + dx / rect.width, 0, 1 - zone.w);
+        zone.y = clamp(zone.y + dy / rect.height, 0, 1 - zone.h);
+        applyZoneStyle(zone);
+      });
+    });
+
+    el.querySelectorAll('.handle').forEach(function(h){
+      h.addEventListener('pointerdown', function(ev){
+        ev.preventDefault(); ev.stopPropagation();
+        selectZone(zone.id);
+        const corner = h.dataset.corner;
+        const start = { x:zone.x, y:zone.y, w:zone.w, h:zone.h };
+        startDrag(ev, function(dx, dy){
+          const rect = stage.getBoundingClientRect();
+          const ndx = dx / rect.width, ndy = dy / rect.height;
+          let { x, y, w, h } = start;
+          if (corner === 'se'){ w = start.w + ndx; h = start.h + ndy; }
+          if (corner === 'ne'){ w = start.w + ndx; h = start.h - ndy; y = start.y + ndy; }
+          if (corner === 'sw'){ w = start.w - ndx; h = start.h + ndy; x = start.x + ndx; }
+          if (corner === 'nw'){ w = start.w - ndx; h = start.h - ndy; x = start.x + ndx; y = start.y + ndy; }
+          const MIN = 0.06;
+          if (w < MIN){ if (corner === 'se' || corner === 'ne') w = MIN; else { x = start.x + start.w - MIN; w = MIN; } }
+          if (h < MIN){ if (corner === 'se' || corner === 'sw') h = MIN; else { y = start.y + start.h - MIN; h = MIN; } }
+          zone.x = clamp(x, 0, 1); zone.y = clamp(y, 0, 1);
+          zone.w = clamp(w, MIN, 1 - zone.x); zone.h = clamp(h, MIN, 1 - zone.y);
+          applyZoneStyle(zone);
+        });
+      });
+    });
+  }
+
+  function startDrag(ev, onMove){
+    const startX = ev.clientX, startY = ev.clientY;
+    const pid = ev.pointerId;
+    function move(e){ onMove(e.clientX - startX, e.clientY - startY); }
+    function up(){
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    }
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  }
+
+  function clamp(v, min, max){ return Math.min(Math.max(v, min), max); }
+
+  function applyZoneStyle(zone){
+    zone.el.style.left = (zone.x * 100) + '%';
+    zone.el.style.top = (zone.y * 100) + '%';
+    zone.el.style.width = (zone.w * 100) + '%';
+    zone.el.style.height = (zone.h * 100) + '%';
+    // la couleur réelle de la zone est peinte dans le canevas (drawFrame) ;
+    // ce contour ne sert qu'à la montrer et à la manipuler
+    zone.el.style.borderColor = zone.color === '#000000' ? '#fff' : zone.color;
+    zone.el.setAttribute('data-selected', String(zone.id === state.selectedId));
+    // sur une zone très réduite, l'étiquette déborderait et chevaucherait ses voisines
+    const tag = zone.el.querySelector('.zone-tag');
+    if (tag) tag.style.display = (zone.w < 0.12 || zone.h < 0.1) ? 'none' : '';
+  }
+
+  function selectZone(id){
+    state.selectedId = id;
+    state.zones.forEach(z => z.el.setAttribute('data-selected', String(z.id === id)));
+    const zone = state.zones.find(z => z.id === id);
+    if (zone){
+      state.activeColor = zone.color;
+      state.activeIntensity = zone.intensity;
+      $('c-custom-color').value = zone.color;
+      $('c-hex-input').value = zone.color;
+      $('c-hex-input').classList.remove('invalid');
+      $('c-hex-error').textContent = '';
+      $('c-intensity').value = Math.round(zone.intensity * 100);
+      $('c-intensity-out').textContent = Math.round(zone.intensity * 100) + '%';
+      syncSwatchSelection();
+    }
+    renderZonesList();
+  }
+
+  function deleteZone(id){
+    const zone = state.zones.find(z => z.id === id);
+    if (zone) zone.el.remove();
+    state.zones = state.zones.filter(z => z.id !== id);
+    if (state.selectedId === id) state.selectedId = null;
+    renderZonesList();
+  }
+
+  function renderZonesList(){
+    const wrap = $('c-zones-list');
+    wrap.innerHTML = '';
+    $('c-zone-counter').textContent = state.zones.length;
+    if (!state.zones.length){
+      const p = document.createElement('p');
+      p.className = 'empty-note';
+      p.textContent = 'Aucune zone. Clique sur « + Zone » pour en ajouter une sur l\'image.';
+      wrap.appendChild(p);
+      return;
+    }
+    state.zones.forEach(function(zone){
+      // div[role="button"] plutôt qu'un <button> : un bouton ne doit pas
+      // contenir un autre élément interactif (le bouton « supprimer »).
+      const row = document.createElement('div');
+      row.className = 'zone-row';
+      row.setAttribute('role', 'button');
+      row.tabIndex = 0;
+      row.setAttribute('aria-pressed', String(zone.id === state.selectedId));
+      row.setAttribute('aria-label', zone.label + ' — flèches pour déplacer, Maj+flèches pour redimensionner');
+      row.innerHTML =
+        '<span class="chip" style="background:' + zone.color + '"></span>' +
+        '<span class="label">' + zone.label + '</span>' +
+        '<button type="button" class="del" aria-label="Supprimer ' + zone.label + '" data-del="' + zone.id + '">×</button>';
+      row.addEventListener('click', function(ev){
+        if (ev.target.closest('[data-del]')) return;
+        selectZone(zone.id);
+      });
+      // clavier : Entrée/Espace sélectionne ; flèches déplacent la zone ;
+      // Maj+flèches la redimensionnent — alternative à la souris/au doigt.
+      row.addEventListener('keydown', function(ev){
+        if (ev.target !== row) return;
+        const STEP = 0.02, MIN = 0.06;
+        if (ev.key === 'Enter' || ev.key === ' '){
+          ev.preventDefault(); selectZone(zone.id); return;
+        }
+        const arrows = { ArrowUp:[0,-1], ArrowDown:[0,1], ArrowLeft:[-1,0], ArrowRight:[1,0] };
+        if (!arrows[ev.key]) return;
+        ev.preventDefault();
+        const [dx, dy] = arrows[ev.key];
+        if (ev.shiftKey){
+          zone.w = clamp(zone.w + dx * STEP, MIN, 1 - zone.x);
+          zone.h = clamp(zone.h + dy * STEP, MIN, 1 - zone.y);
+        } else {
+          zone.x = clamp(zone.x + dx * STEP, 0, 1 - zone.w);
+          zone.y = clamp(zone.y + dy * STEP, 0, 1 - zone.h);
+        }
+        applyZoneStyle(zone);
+      });
+      row.querySelector('[data-del]').addEventListener('click', function(ev){
+        ev.stopPropagation(); deleteZone(zone.id);
+      });
+      wrap.appendChild(row);
+    });
+  }
+
+  $('c-btn-add-zone').addEventListener('click', addZone);
+
+  /* ================= 3. Panneau couleur ================= */
+  function buildSwatches(){
+    const wrap = $('c-swatches');
+    wrap.innerHTML = '';
+    SWATCHES.forEach(function(s){
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'swatch'; b.style.background = s.hex;
+      b.setAttribute('aria-pressed', 'false'); b.setAttribute('aria-label', s.hex);
+      b.addEventListener('click', function(){ setActiveColor(s.hex); });
+      wrap.appendChild(b);
+    });
+  }
+  function syncSwatchSelection(){
+    $('c-swatches').querySelectorAll('.swatch').forEach(function(b, i){
+      b.setAttribute('aria-pressed', String(SWATCHES[i].hex.toLowerCase() === state.activeColor.toLowerCase()));
+    });
+  }
+  function isValidHex(v){ return /^#[0-9a-fA-F]{6}$/.test(v); }
+
+  function setActiveColor(hex, fromHexField){
+    state.activeColor = hex;
+    $('c-custom-color').value = hex;
+    if (!fromHexField) $('c-hex-input').value = hex;
+    $('c-hex-input').classList.remove('invalid');
+    $('c-hex-error').textContent = '';
+    syncSwatchSelection();
+    applyToSelected();
+  }
+  function applyToSelected(){
+    const zone = state.zones.find(z => z.id === state.selectedId);
+    if (zone){
+      zone.color = state.activeColor;
+      zone.intensity = state.activeIntensity;
+      applyZoneStyle(zone);
+      renderZonesList();
+    }
+  }
+  $('c-custom-color').addEventListener('input', function(){ setActiveColor(this.value); });
+  $('c-hex-input').addEventListener('input', function(){
+    const v = this.value.trim();
+    if (isValidHex(v)) setActiveColor(v, true);
+    else { this.classList.add('invalid'); $('c-hex-error').textContent = v === '' ? '' : 'Format attendu : #1F6F78'; }
+  });
+  $('c-intensity').addEventListener('input', function(){
+    state.activeIntensity = Number(this.value) / 100;
+    $('c-intensity-out').textContent = this.value + '%';
+    applyToSelected();
+  });
+
+  /* ================= 4. Ambiance ================= */
+  function buildAmbianceButtons(){
+    const wrap = $('c-ambiance-grid');
+    wrap.innerHTML = '';
+    AMBIANCES.forEach(function(a){
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'amb-btn';
+      b.setAttribute('aria-pressed', String(a.id === state.ambiance));
+      b.innerHTML = a.label + '<span class="sub">' + a.sub + '</span>';
+      b.addEventListener('click', function(){
+        state.ambiance = a.id; // appliqué à chaque image dans drawFrame()
+        wrap.querySelectorAll('.amb-btn').forEach(function(btn, i){
+          btn.setAttribute('aria-pressed', String(AMBIANCES[i].id === a.id));
+        });
+      });
+      wrap.appendChild(b);
+    });
+  }
+
+  /* ================= 5. Capture (export PNG) ================= */
+  $('c-btn-capture').addEventListener('click', function(){
+    const btn = this;
+    if (!view.width || !view.height) return;
+    // le canevas visible contient déjà la vidéo, la teinte des zones et le
+    // filtre d'ambiance — il suffit de l'exporter tel quel.
+    view.toBlob(function(blob){
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'nuancier-mural-camera.png';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function(){ URL.revokeObjectURL(url); }, 2000);
+      btn.textContent = 'Enregistré ✓';
+      setTimeout(function(){ btn.textContent = "Capturer l'image"; }, 1500);
+    }, 'image/png');
+  });
+
+  /* ================= 6. Démarrage ================= */
+  buildSwatches();
+  buildAmbianceButtons();
+  syncSwatchSelection();
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    showError({ name:'SecurityError' });
+  }
+
+  window.addEventListener('beforeunload', function(){
+    if (state.stream) state.stream.getTracks().forEach(t => t.stop());
+  });
+})();
+</script>
+<script>
+(function(){
+  "use strict";
+  var views = { home: 'view-home', photo: 'view-photo', camera: 'view-camera' };
+  var titles = { home: 'Nuancier Mural', photo: 'Nuancier Mural — Photo', camera: 'Nuancier Mural — Caméra' };
+
+  function showView(name){
+    Object.keys(views).forEach(function(key){
+      document.getElementById(views[key]).hidden = (key !== name);
+    });
+    document.getElementById('btn-home').hidden = (name === 'home');
+    document.getElementById('app-title').textContent = titles[name];
+    if (name !== 'camera') document.getElementById('c-live-indicator').hidden = true;
+    try { history.replaceState(null, '', '#' + name); } catch(e){}
+  }
+
+  document.getElementById('btn-mode-camera').addEventListener('click', function(){ showView('camera'); });
+  document.getElementById('btn-mode-photo').addEventListener('click', function(){ showView('photo'); });
+  document.getElementById('btn-home').addEventListener('click', function(){ showView('home'); });
+
+  showView('home');
+})();
+</script>
+</body>
+</html>
